@@ -204,8 +204,8 @@
       "id": "svc_infra",
       "name": "Infrastructure",
       "position": {
-        "x": 921.9682499999999,
-        "y": 233.837
+        "x": 1207.8927499999998,
+        "y": 182.12725
       },
       "description": {
         "high": "All the AWS plumbing declared as code — DynamoDB table, two Lambda functions, an HTTP API via API Gateway, an EventBridge schedule for daily digests, SES sender verification, and a remote Terraform state backend with locking.",
