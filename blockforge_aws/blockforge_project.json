@@ -9,8 +9,8 @@
       "id": "mod_proxy",
       "name": "llm-proxy",
       "position": {
-        "x": 80,
-        "y": 220
+        "x": 0,
+        "y": 229.12525
       },
       "description": {
         "high": "A small relay that receives the app's AI requests and forwards them to Anthropic, adding the secret API key on the server so it never reaches anyone's browser.",
@@ -102,8 +102,8 @@
       "id": "mod_site",
       "name": "static-site",
       "position": {
-        "x": 406.12325,
-        "y": 0
+        "x": 415.2485,
+        "y": 34.980124999999994
       },
       "description": {
         "high": "Hosts the BlockForge web page itself: a locked filing cabinet (S3) and a worldwide delivery network (CloudFront) that is the only one with a key.",
