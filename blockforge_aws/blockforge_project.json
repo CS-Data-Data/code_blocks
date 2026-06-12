@@ -1,0 +1,459 @@
+{
+  "name": "blockforge-aws",
+  "description": {
+    "high": "Serverless AWS deployment for BlockForge: the app is served from a private S3 bucket through CloudFront, and an API Gateway + Lambda proxy keeps the LLM API key on the server.",
+    "tech": "Three Terraform feature modules: static-site (S3 + CloudFront OAC), llm-proxy (HTTP API + Python Lambda forwarding to Anthropic), dns (optional ACM cert in us-east-1 + Route53 aliases). A dev environment wires them together."
+  },
+  "services": [
+    {
+      "id": "mod_proxy",
+      "name": "llm-proxy",
+      "position": {
+        "x": 80,
+        "y": 220
+      },
+      "description": {
+        "high": "A small relay that receives the app's AI requests and forwards them to Anthropic, adding the secret API key on the server so it never reaches anyone's browser.",
+        "tech": "API Gateway HTTP API (CORS, throttled) → AWS_PROXY integration → Python 3.12 Lambda. Key injected from a sensitive Terraform variable into the Lambda environment. Basic execution role only."
+      },
+      "blocks": [
+        {
+          "id": "tb_api",
+          "type": "resource",
+          "name": "aws_apigatewayv2_api.proxy",
+          "description": {
+            "high": "The public web address the app sends AI requests to.",
+            "tech": "HTTP API with CORS allowing the site origin, POST/OPTIONS, LLM headers. $default stage auto-deploys with 5 rps / 10 burst throttling."
+          },
+          "inputs": [
+            {
+              "name": "allowed_origins",
+              "type": "list(string)",
+              "description": "CORS origins"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "api_endpoint",
+              "type": "string",
+              "description": "Invoke URL"
+            }
+          ],
+          "code": "resource \"aws_apigatewayv2_api\" \"proxy\" {\n  name          = \"${var.project_name}-${var.environment}-llm-proxy\"\n  protocol_type = \"HTTP\"\n\n  cors_configuration {\n    allow_origins = var.allowed_origins\n    allow_methods = [\"POST\", \"OPTIONS\"]\n    allow_headers = [\"content-type\", \"x-api-key\", \"anthropic-version\"]\n    max_age       = 3600\n  }\n}\n\nresource \"aws_apigatewayv2_route\" \"messages\" {\n  api_id    = aws_apigatewayv2_api.proxy.id\n  route_key = \"POST /v1/messages\"\n  target    = \"integrations/${aws_apigatewayv2_integration.lambda.id}\"\n}"
+        },
+        {
+          "id": "tb_lambda",
+          "type": "resource",
+          "name": "aws_lambda_function.proxy",
+          "description": {
+            "high": "The worker that actually relays each request to Anthropic and returns the answer.",
+            "tech": "Python 3.12, 120s timeout for slow generations, env vars ANTHROPIC_API_KEY/ANTHROPIC_BASE_URL, zipped from src/ via archive_file, logs to a 14-day retention log group."
+          },
+          "inputs": [
+            {
+              "name": "anthropic_api_key",
+              "type": "string (sensitive)",
+              "description": "Injected env var"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "invoke_arn",
+              "type": "string",
+              "description": "For the API integration"
+            }
+          ],
+          "code": "resource \"aws_lambda_function\" \"proxy\" {\n  function_name    = \"${var.project_name}-${var.environment}-llm-proxy\"\n  role             = aws_iam_role.lambda.arn\n  runtime          = \"python3.12\"\n  handler          = \"index.handler\"\n  filename         = data.archive_file.lambda.output_path\n  source_code_hash = data.archive_file.lambda.output_base64sha256\n  timeout          = 120\n\n  environment {\n    variables = {\n      ANTHROPIC_API_KEY  = var.anthropic_api_key\n      ANTHROPIC_BASE_URL = var.anthropic_base_url\n    }\n  }\n}"
+        },
+        {
+          "id": "tb_role",
+          "type": "resource",
+          "name": "aws_iam_role.lambda",
+          "description": {
+            "high": "The permission badge the relay wears — it may write logs and nothing else.",
+            "tech": "Assume-role policy for lambda.amazonaws.com plus the AWSLambdaBasicExecutionRole managed policy. Outbound HTTPS needs no IAM."
+          },
+          "inputs": [],
+          "outputs": [
+            {
+              "name": "arn",
+              "type": "string",
+              "description": "Role ARN for the function"
+            }
+          ],
+          "code": "resource \"aws_iam_role\" \"lambda\" {\n  name               = \"${var.project_name}-${var.environment}-llm-proxy-role\"\n  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json\n}\n\nresource \"aws_iam_role_policy_attachment\" \"lambda_basic_execution\" {\n  role       = aws_iam_role.lambda.name\n  policy_arn = \"arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole\"\n}"
+        },
+        {
+          "id": "tb_key",
+          "type": "variable",
+          "name": "var.anthropic_api_key",
+          "description": {
+            "high": "The secret key for the AI service, kept out of the code and out of browsers.",
+            "tech": "Sensitive string variable; supply via TF_VAR_anthropic_api_key env var, never tfvars in git."
+          },
+          "inputs": [],
+          "outputs": [],
+          "code": "variable \"anthropic_api_key\" {\n  description = \"Anthropic API key the proxy uses server-side\"\n  type        = string\n  sensitive   = true\n}"
+        }
+      ],
+      "color": "#58a6ff"
+    },
+    {
+      "id": "mod_site",
+      "name": "static-site",
+      "position": {
+        "x": 406.12325,
+        "y": 0
+      },
+      "description": {
+        "high": "Hosts the BlockForge web page itself: a locked filing cabinet (S3) and a worldwide delivery network (CloudFront) that is the only one with a key.",
+        "tech": "Private S3 bucket (PAB on, SSE-S3, versioned) + CloudFront distribution with Origin Access Control. Bucket policy grants s3:GetObject only to the distribution ARN. index.html uploaded as aws_s3_object with etag-based change detection."
+      },
+      "blocks": [
+        {
+          "id": "tb_bucket",
+          "type": "resource",
+          "name": "aws_s3_bucket.site",
+          "description": {
+            "high": "Private storage holding the app's single HTML file.",
+            "tech": "bucket_prefix naming to avoid global collisions, force_destroy for dev teardown, public access fully blocked, AES256 encryption, versioning enabled."
+          },
+          "inputs": [],
+          "outputs": [
+            {
+              "name": "bucket_regional_domain_name",
+              "type": "string",
+              "description": "CloudFront origin"
+            }
+          ],
+          "code": "resource \"aws_s3_bucket\" \"site\" {\n  bucket_prefix = \"${var.project_name}-${var.environment}-site-\"\n  force_destroy = true\n}\n\nresource \"aws_s3_bucket_public_access_block\" \"site\" {\n  bucket                  = aws_s3_bucket.site.id\n  block_public_acls       = true\n  block_public_policy     = true\n  ignore_public_acls      = true\n  restrict_public_buckets = true\n}\n\nresource \"aws_s3_object\" \"app\" {\n  bucket       = aws_s3_bucket.site.id\n  key          = \"index.html\"\n  source       = var.app_source_path\n  content_type = \"text/html\"\n  etag         = filemd5(var.app_source_path)\n}"
+        },
+        {
+          "id": "tb_cf",
+          "type": "resource",
+          "name": "aws_cloudfront_distribution.site",
+          "description": {
+            "high": "The delivery network that serves the page quickly and securely anywhere in the world.",
+            "tech": "OAC-signed S3 origin, redirect-to-https, managed CachingOptimized policy, compress on, default root object index.html, 403/404 rewritten to /index.html for SPA routing, optional ACM cert + aliases."
+          },
+          "inputs": [
+            {
+              "name": "acm_certificate_arn",
+              "type": "string",
+              "description": "Optional custom-domain cert"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "domain_name",
+              "type": "string",
+              "description": "Public URL host"
+            }
+          ],
+          "code": "resource \"aws_cloudfront_distribution\" \"site\" {\n  enabled             = true\n  default_root_object = \"index.html\"\n  aliases             = var.aliases\n\n  origin {\n    domain_name              = aws_s3_bucket.site.bucket_regional_domain_name\n    origin_id                = \"s3-site\"\n    origin_access_control_id = aws_cloudfront_origin_access_control.site.id\n  }\n\n  default_cache_behavior {\n    target_origin_id       = \"s3-site\"\n    viewer_protocol_policy = \"redirect-to-https\"\n    allowed_methods        = [\"GET\", \"HEAD\", \"OPTIONS\"]\n    cached_methods         = [\"GET\", \"HEAD\"]\n    cache_policy_id        = data.aws_cloudfront_cache_policy.caching_optimized.id\n    compress               = true\n  }\n\n  viewer_certificate {\n    cloudfront_default_certificate = var.acm_certificate_arn == \"\" ? true : false\n  }\n}"
+        },
+        {
+          "id": "tb_policy",
+          "type": "data",
+          "name": "aws_iam_policy_document.site_bucket_policy",
+          "description": {
+            "high": "The rule saying 'only our delivery network may open the filing cabinet'.",
+            "tech": "Allows s3:GetObject on bucket/* to principal cloudfront.amazonaws.com, conditioned on AWS:SourceArn == the distribution ARN."
+          },
+          "inputs": [
+            {
+              "name": "distribution_arn",
+              "type": "string",
+              "description": "Locks reads to this distribution"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "json",
+              "type": "string",
+              "description": "Rendered policy"
+            }
+          ],
+          "code": "data \"aws_iam_policy_document\" \"site_bucket_policy\" {\n  statement {\n    sid       = \"AllowCloudFrontServicePrincipalReadOnly\"\n    actions   = [\"s3:GetObject\"]\n    resources = [\"${aws_s3_bucket.site.arn}/*\"]\n\n    principals {\n      type        = \"Service\"\n      identifiers = [\"cloudfront.amazonaws.com\"]\n    }\n\n    condition {\n      test     = \"StringEquals\"\n      variable = \"AWS:SourceArn\"\n      values   = [aws_cloudfront_distribution.site.arn]\n    }\n  }\n}"
+        },
+        {
+          "id": "tb_url",
+          "type": "output",
+          "name": "output.site_url",
+          "description": {
+            "high": "The finished website address, printed after deployment.",
+            "tech": "Interpolates the distribution domain into an https URL for the environment outputs."
+          },
+          "inputs": [],
+          "outputs": [],
+          "code": "output \"site_url\" {\n  description = \"URL of the deployed site\"\n  value       = \"https://${aws_cloudfront_distribution.site.domain_name}\"\n}"
+        }
+      ],
+      "color": "#bc8cff"
+    },
+    {
+      "id": "mod_dns",
+      "name": "dns",
+      "position": {
+        "x": 969.5029999999999,
+        "y": 87.68387500000003
+      },
+      "description": {
+        "high": "Optional: gives the site a friendly custom name (like blockforge.example.com) with a proper certificate.",
+        "tech": "ACM certificate created in us-east-1 (CloudFront requirement, provider alias), DNS-validated via Route53 records, then A/AAAA alias records to the distribution. Enabled with count when domain_name is set."
+      },
+      "blocks": [
+        {
+          "id": "tb_cert",
+          "type": "resource",
+          "name": "aws_acm_certificate.site",
+          "description": {
+            "high": "The certificate proving the custom domain really belongs to this site.",
+            "tech": "DNS validation; create_before_destroy for rotation; provider alias aws.us_east_1 because CloudFront only accepts us-east-1 certs."
+          },
+          "inputs": [
+            {
+              "name": "domain_name",
+              "type": "string",
+              "description": "FQDN to certify"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "arn",
+              "type": "string",
+              "description": "Cert ARN for CloudFront"
+            }
+          ],
+          "code": "resource \"aws_acm_certificate\" \"site\" {\n  provider          = aws.us_east_1\n  domain_name       = var.domain_name\n  validation_method = \"DNS\"\n\n  lifecycle {\n    create_before_destroy = true\n  }\n}"
+        },
+        {
+          "id": "tb_alias",
+          "type": "resource",
+          "name": "aws_route53_record.site_a",
+          "description": {
+            "high": "The signpost pointing the custom name at the delivery network.",
+            "tech": "A (and AAAA) alias records in the hosted zone targeting the distribution domain + CloudFront hosted zone id; no health evaluation."
+          },
+          "inputs": [
+            {
+              "name": "distribution_domain_name",
+              "type": "string",
+              "description": "Alias target"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "fqdn",
+              "type": "string",
+              "description": "Final site name"
+            }
+          ],
+          "code": "resource \"aws_route53_record\" \"site_a\" {\n  zone_id = data.aws_route53_zone.this.zone_id\n  name    = var.domain_name\n  type    = \"A\"\n\n  alias {\n    name                   = var.distribution_domain_name\n    zone_id                = var.distribution_hosted_zone_id\n    evaluate_target_health = false\n  }\n}"
+        }
+      ],
+      "color": "#3fb950"
+    }
+  ],
+  "links": [
+    {
+      "id": "tl1",
+      "from": {
+        "service": "mod_site",
+        "block": "tb_cf"
+      },
+      "to": {
+        "service": "mod_site",
+        "block": "tb_bucket"
+      },
+      "label": "origin fetch (OAC)",
+      "description": "On a cache miss, CloudFront fetches index.html from the private bucket using a SigV4-signed request via the Origin Access Control.",
+      "dataStructure": {
+        "name": "Signed S3 GetObject",
+        "format": "HTTPS request (SigV4 via OAC)",
+        "fields": [
+          {
+            "name": "Host",
+            "type": "header",
+            "description": "bucket regional endpoint"
+          },
+          {
+            "name": "Authorization",
+            "type": "header",
+            "description": "AWS4-HMAC-SHA256 signature from CloudFront"
+          },
+          {
+            "name": "path",
+            "type": "string",
+            "description": "/index.html"
+          }
+        ],
+        "example": {
+          "method": "GET",
+          "path": "/index.html",
+          "Host": "blockforge-dev-site-abc123.s3.us-east-1.amazonaws.com"
+        }
+      }
+    },
+    {
+      "id": "tl2",
+      "from": {
+        "service": "mod_site",
+        "block": "tb_cf"
+      },
+      "to": {
+        "service": "mod_site",
+        "block": "tb_policy"
+      },
+      "label": "SourceArn condition",
+      "description": "The bucket policy references the distribution's ARN so only this distribution can read objects.",
+      "dataStructure": {
+        "name": "distribution_arn",
+        "format": "Terraform attribute reference",
+        "fields": [
+          {
+            "name": "aws_cloudfront_distribution.site.arn",
+            "type": "string",
+            "description": "Consumed in the policy condition"
+          }
+        ],
+        "example": {
+          "arn": "arn:aws:cloudfront::123456789012:distribution/E2EXAMPLE"
+        }
+      }
+    },
+    {
+      "id": "tl3",
+      "from": {
+        "service": "mod_proxy",
+        "block": "tb_api"
+      },
+      "to": {
+        "service": "mod_proxy",
+        "block": "tb_lambda"
+      },
+      "label": "AWS_PROXY invoke",
+      "description": "API Gateway wraps each HTTP request in a v2.0 event and invokes the Lambda synchronously.",
+      "dataStructure": {
+        "name": "APIGW HTTP event v2.0",
+        "format": "JSON (Lambda proxy integration)",
+        "fields": [
+          {
+            "name": "rawPath",
+            "type": "string",
+            "description": "/v1/messages"
+          },
+          {
+            "name": "body",
+            "type": "string",
+            "description": "Anthropic Messages API payload (possibly base64)"
+          },
+          {
+            "name": "headers",
+            "type": "map",
+            "description": "Client headers (key is stripped/ignored)"
+          },
+          {
+            "name": "requestContext.http.method",
+            "type": "string",
+            "description": "POST"
+          }
+        ],
+        "example": {
+          "rawPath": "/v1/messages",
+          "isBase64Encoded": false,
+          "body": "{\"model\":\"claude-sonnet-4-6\",\"max_tokens\":16000,\"messages\":[]}"
+        }
+      }
+    },
+    {
+      "id": "tl4",
+      "from": {
+        "service": "mod_proxy",
+        "block": "tb_key"
+      },
+      "to": {
+        "service": "mod_proxy",
+        "block": "tb_lambda"
+      },
+      "label": "env injection",
+      "description": "The sensitive variable lands in the function's environment at deploy time; never in source or state outputs.",
+      "dataStructure": {
+        "name": "Lambda environment",
+        "format": "Terraform variable → env var",
+        "fields": [
+          {
+            "name": "ANTHROPIC_API_KEY",
+            "type": "string (sensitive)",
+            "description": "Read by index.py at runtime"
+          }
+        ],
+        "example": {
+          "ANTHROPIC_API_KEY": "sk-ant-•••",
+          "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+        }
+      }
+    },
+    {
+      "id": "tl5",
+      "from": {
+        "service": "mod_dns",
+        "block": "tb_cert"
+      },
+      "to": {
+        "service": "mod_site",
+        "block": "tb_cf"
+      },
+      "label": "certificate_arn",
+      "description": "The validated certificate ARN flows into the distribution's viewer_certificate so the custom domain serves real TLS.",
+      "dataStructure": {
+        "name": "acm_certificate_arn",
+        "format": "Terraform module output → input variable",
+        "fields": [
+          {
+            "name": "certificate_arn",
+            "type": "string",
+            "description": "us-east-1 ACM cert, post-validation"
+          }
+        ],
+        "example": {
+          "certificate_arn": "arn:aws:acm:us-east-1:123456789012:certificate/uuid"
+        }
+      }
+    },
+    {
+      "id": "tl6",
+      "from": {
+        "service": "mod_dns",
+        "block": "tb_alias"
+      },
+      "to": {
+        "service": "mod_site",
+        "block": "tb_cf"
+      },
+      "label": "alias target",
+      "description": "The Route53 alias record points the friendly domain at the distribution's domain name and zone.",
+      "dataStructure": {
+        "name": "alias",
+        "format": "Route53 alias block",
+        "fields": [
+          {
+            "name": "name",
+            "type": "string",
+            "description": "d111abcdef8.cloudfront.net"
+          },
+          {
+            "name": "zone_id",
+            "type": "string",
+            "description": "CloudFront hosted zone (Z2FDTNDATAQYW2)"
+          }
+        ],
+        "example": {
+          "name": "d111abcdef8.cloudfront.net",
+          "zone_id": "Z2FDTNDATAQYW2",
+          "evaluate_target_health": false
+        }
+      }
+    }
+  ]
+}
