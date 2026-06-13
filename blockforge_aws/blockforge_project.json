@@ -195,8 +195,8 @@
       "id": "mod_dns",
       "name": "dns",
       "position": {
-        "x": 969.5029999999999,
-        "y": 87.68387500000003
+        "x": 1077.9413875,
+        "y": 84.18586250000003
       },
       "description": {
         "high": "Optional: gives the site a friendly custom name (like blockforge.example.com) with a proper certificate.",
@@ -259,8 +259,8 @@
       "name": "Infrastructure",
       "color": "#8b949e",
       "position": {
-        "x": 80,
-        "y": 420
+        "x": 695.9543749999999,
+        "y": 421.520875
       },
       "description": {
         "high": "All the AWS plumbing declared as code — DynamoDB table, two Lambda functions, an HTTP API via API Gateway, an EventBridge schedule for daily digests, SES sender verification, and a remote Terraform state backend with locking.",
