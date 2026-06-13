@@ -33,6 +33,18 @@ Optional: gives the site a friendly custom name (like blockforge.example.com) wi
 - **aws_acm_certificate.site** (resource): The certificate proving the custom domain really belongs to this site.
 - **aws_route53_record.site_a** (resource): The signpost pointing the custom name at the delivery network.
 
+### Infrastructure (`modules/infrastructure/`)
+
+All the AWS plumbing declared as code — DynamoDB table, two Lambda functions, an HTTP API via API Gateway, an EventBridge schedule for daily digests, SES sender verification, and a remote Terraform state backend with locking.
+
+- **variables.tf** (config): Declares all tuneable inputs for the deployment: AWS region, DynamoDB table name, the sender email address, and the notification recipient. Sensitive values must be supplied at plan/apply time and must never be committed to source control.
+- **backend.tf** (config): Tells Terraform to store its state file safely in an S3 bucket with encryption, and use a DynamoDB table to prevent two people applying changes at the same time.
+- **aws_dynamodb_table.tasks** (config): Creates the DynamoDB table that stores all tasks. Uses on-demand billing so you only pay per request, enables automatic backups so you can restore to any point in the last 35 days, and encrypts all data at rest.
+- **aws_lambda_function.api** (config): Packages and deploys the API Lambda that handles HTTP requests from API Gateway. Gives it just enough permissions to read/write the tasks table and nothing more, plus the ability to send emails via SES.
+- **aws_lambda_function.notify** (config): Deploys the scheduled Lambda that checks for overdue tasks and sends the daily digest email. An EventBridge Scheduler rule fires it every morning at 08:00 UTC with a 5-minute flexible window to smooth AWS capacity.
+- **aws_apigatewayv2_api.taskflow** (config): Sets up the public HTTP API that routes GET and POST requests on the /tasks path to the API Lambda, and outputs the URL you call from a browser or mobile app.
+- **aws_ses_email_identity.sender** (config): Registers the sender email address with Amazon SES so AWS will allow email to be sent from it. AWS sends a verification link to that address — the owner must click it before any emails can go out. Note: new AWS accounts are in the SES sandbox, which means you can only send to verified addresses; request production access in the SES console when ready.
+
 ## References between blocks
 
 - **static-site → static-site** — origin fetch (OAC): On a cache miss, CloudFront fetches index.html from the private bucket using a SigV4-signed request via the Origin Access Control. (value: Signed S3 GetObject)

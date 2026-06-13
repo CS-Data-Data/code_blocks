@@ -13,3 +13,7 @@ module "dns" {
   source = "../modules/dns"
   # TODO: set this module's input variables
 }
+module "infrastructure" {
+  source = "../modules/infrastructure"
+  # TODO: set this module's input variables
+}

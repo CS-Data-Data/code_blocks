@@ -253,6 +253,251 @@
         }
       ],
       "color": "#3fb950"
+    },
+    {
+      "id": "ym22g0hk",
+      "name": "Infrastructure",
+      "color": "#8b949e",
+      "position": {
+        "x": 80,
+        "y": 420
+      },
+      "description": {
+        "high": "All the AWS plumbing declared as code — DynamoDB table, two Lambda functions, an HTTP API via API Gateway, an EventBridge schedule for daily digests, SES sender verification, and a remote Terraform state backend with locking.",
+        "tech": "Terraform HCL configuration targeting the AWS provider. Declares aws_dynamodb_table (PAY_PER_REQUEST, GSI on status), two aws_lambda_function resources sharing one IAM role with least-privilege inline policies (DynamoDB PutItem/Scan + SES SendEmail), aws_apigatewayv2_api HTTP API with two routes and Lambda integrations, aws_scheduler_schedule for the notify Lambda (daily 08:00 UTC), aws_ses_email_identity for sender verification, input variables with sensitive flags, and an S3+DynamoDB remote backend."
+      },
+      "blocks": [
+        {
+          "id": "b_tf_vars",
+          "type": "config",
+          "name": "variables.tf",
+          "description": {
+            "high": "Declares all tuneable inputs for the deployment: AWS region, DynamoDB table name, the sender email address, and the notification recipient. Sensitive values must be supplied at plan/apply time and must never be committed to source control.",
+            "tech": "Terraform variable blocks. `aws_region` (string, default 'us-east-1') drives the provider and SES client region. `table_name` (string, default 'tasks') is passed to aws_dynamodb_table and injected into Lambda env as DYNAMODB_TABLE. `ses_from_email` (string, sensitive=true, no default) is used for aws_ses_email_identity and the SES_FROM_EMAIL Lambda env var. `notify_email` (string, sensitive=true, no default) is injected as NOTIFY_EMAIL. A terraform.tfvars.example comment documents the expected shape without revealing real values."
+          },
+          "inputs": [],
+          "outputs": [
+            {
+              "name": "aws_region",
+              "type": "string",
+              "description": "AWS region for all resources; default us-east-1"
+            },
+            {
+              "name": "table_name",
+              "type": "string",
+              "description": "DynamoDB table name; default tasks"
+            },
+            {
+              "name": "ses_from_email",
+              "type": "string",
+              "description": "SES verified sender address; sensitive, no default"
+            },
+            {
+              "name": "notify_email",
+              "type": "string",
+              "description": "Digest recipient address; sensitive, no default"
+            }
+          ],
+          "code": "# variables.tf\n# ---------------------------------------------------------------\n# All tuneable inputs for the TaskFlow deployment.\n# Sensitive vars have no defaults — supply via terraform.tfvars\n# (gitignored) or via TF_VAR_* environment variables in CI.\n#\n# terraform.tfvars.example (copy → terraform.tfvars, DO NOT COMMIT):\n#   aws_region     = \"us-east-1\"\n#   table_name     = \"tasks\"\n#   ses_from_email = \"sender@example.com\"\n#   notify_email   = \"ops@example.com\"\n# ---------------------------------------------------------------\n\nvariable \"aws_region\" {\n  description = \"AWS region for all resources.\"\n  type        = string\n  default     = \"us-east-1\"\n}\n\nvariable \"table_name\" {\n  description = \"Name of the DynamoDB tasks table.\"\n  type        = string\n  default     = \"tasks\"\n}\n\nvariable \"ses_from_email\" {\n  description = \"SES-verified sender email address used by the notification Lambda.\"\n  type        = string\n  sensitive   = true\n}\n\nvariable \"notify_email\" {\n  description = \"Recipient email address for the daily overdue-task digest.\"\n  type        = string\n  sensitive   = true\n}"
+        },
+        {
+          "id": "b_tf_backend",
+          "type": "config",
+          "name": "backend.tf",
+          "description": {
+            "high": "Tells Terraform to store its state file safely in an S3 bucket with encryption, and use a DynamoDB table to prevent two people applying changes at the same time.",
+            "tech": "Terraform S3 backend block with encrypt=true. Placeholders must be replaced with a pre-existing S3 bucket (versioning enabled, public access blocked) and a DynamoDB table with a LockID (String) hash key for state locking. The state key is 'taskflow/terraform.tfstate'. Provider block pins the AWS provider version to ~> 5.0 and reads the region from var.aws_region."
+          },
+          "inputs": [],
+          "outputs": [],
+          "code": "# backend.tf\n# ---------------------------------------------------------------\n# Remote state in S3 with DynamoDB locking.\n# Prerequisites (provisioned once, outside this config):\n#   - S3 bucket: versioning ON, server-side encryption ON,\n#     Block Public Access ON.\n#   - DynamoDB table: name = <lock-table>, hash key = LockID (S).\n# Replace ALL <placeholder> values before running terraform init.\n# ---------------------------------------------------------------\n\nterraform {\n  required_version = \">= 1.6.0\"\n\n  required_providers {\n    aws = {\n      source  = \"hashicorp/aws\"\n      version = \"~> 5.0\"\n    }\n  }\n\n  backend \"s3\" {\n    # Replace with your pre-existing state bucket name.\n    bucket = \"<your-terraform-state-bucket>\"\n\n    # Path within the bucket for this workspace's state file.\n    key = \"taskflow/terraform.tfstate\"\n\n    # Must match the region where the bucket and lock table live.\n    region = \"<your-state-bucket-region>\"\n\n    # Replace with your pre-existing DynamoDB lock table name.\n    dynamodb_table = \"<your-terraform-lock-table>\"\n\n    # Encrypt state at rest using the bucket's default KMS/SSE key.\n    encrypt = true\n  }\n}\n\nprovider \"aws\" {\n  region = var.aws_region\n}"
+        },
+        {
+          "id": "b_tf_dynamodb",
+          "type": "config",
+          "name": "aws_dynamodb_table.tasks",
+          "description": {
+            "high": "Creates the DynamoDB table that stores all tasks. Uses on-demand billing so you only pay per request, enables automatic backups so you can restore to any point in the last 35 days, and encrypts all data at rest.",
+            "tech": "aws_dynamodb_table resource. billing_mode=PAY_PER_REQUEST eliminates capacity planning. Hash key 'id' (S) is the UUID hex primary key used by TaskRepository. A global secondary index 'status-index' on attribute 'status' (S) with KEYS_ONLY projection supports TaskRepository.find(status=...) FilterExpression scans without reading full items. point_in_time_recovery enabled. server_side_encryption uses AWS managed key (aws_owned_cmk=false defaults to AWS-managed CMK). Table name sourced from var.table_name."
+          },
+          "inputs": [
+            {
+              "name": "var.table_name",
+              "type": "string",
+              "description": "DynamoDB table name, default 'tasks'"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "aws_dynamodb_table.tasks.name",
+              "type": "string",
+              "description": "Actual table name, referenced by Lambda env var DYNAMODB_TABLE"
+            },
+            {
+              "name": "aws_dynamodb_table.tasks.arn",
+              "type": "string",
+              "description": "Table ARN, used in IAM policy to scope DynamoDB permissions"
+            }
+          ],
+          "code": "# dynamodb.tf\n# ---------------------------------------------------------------\n# DynamoDB table for TaskFlow task storage.\n# ---------------------------------------------------------------\n\nresource \"aws_dynamodb_table\" \"tasks\" {\n  name         = var.table_name\n  billing_mode = \"PAY_PER_REQUEST\"\n  hash_key     = \"id\"\n\n  attribute {\n    name = \"id\"\n    type = \"S\"\n  }\n\n  attribute {\n    name = \"status\"\n    type = \"S\"\n  }\n\n  # GSI enables efficient status-filtered queries in TaskRepository.find().\n  global_secondary_index {\n    name            = \"status-index\"\n    hash_key        = \"status\"\n    projection_type = \"KEYS_ONLY\"\n  }\n\n  point_in_time_recovery {\n    enabled = true\n  }\n\n  server_side_encryption {\n    enabled = true\n  }\n\n  tags = {\n    Project = \"TaskFlow\"\n    ManagedBy = \"Terraform\"\n  }\n}"
+        },
+        {
+          "id": "b_tf_lambda_api",
+          "type": "config",
+          "name": "aws_lambda_function.api",
+          "description": {
+            "high": "Packages and deploys the API Lambda that handles HTTP requests from API Gateway. Gives it just enough permissions to read/write the tasks table and nothing more, plus the ability to send emails via SES.",
+            "tech": "aws_lambda_function.api: runtime python3.12, handler handler.lambda_handler, filename from data.archive_file.lambda_zip (or pre-built deployment package), memory 256 MB, timeout 29s (API Gateway integration timeout ceiling). Environment block injects DYNAMODB_TABLE, SES_FROM_EMAIL, NOTIFY_EMAIL, AWS_SES_REGION. Shares aws_iam_role.lambda_exec which has: AWSLambdaBasicExecutionRole managed policy attachment; inline policy allowing dynamodb:PutItem and dynamodb:Scan scoped to aws_dynamodb_table.tasks.arn and its GSI ARN; inline policy allowing ses:SendEmail on '*'. aws_lambda_function_url provides a direct HTTPS URL as a lightweight alternative to API Gateway for testing."
+          },
+          "inputs": [
+            {
+              "name": "var.ses_from_email",
+              "type": "string",
+              "description": "SES sender address injected as SES_FROM_EMAIL env var"
+            },
+            {
+              "name": "var.notify_email",
+              "type": "string",
+              "description": "Digest recipient injected as NOTIFY_EMAIL env var"
+            },
+            {
+              "name": "var.aws_region",
+              "type": "string",
+              "description": "Region injected as AWS_SES_REGION env var"
+            },
+            {
+              "name": "aws_dynamodb_table.tasks.name",
+              "type": "string",
+              "description": "Table name injected as DYNAMODB_TABLE env var"
+            },
+            {
+              "name": "aws_dynamodb_table.tasks.arn",
+              "type": "string",
+              "description": "Table ARN used to scope IAM policy"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "aws_lambda_function.api.arn",
+              "type": "string",
+              "description": "Lambda ARN referenced by API Gateway integration and lambda permission"
+            },
+            {
+              "name": "aws_lambda_function.api.invoke_arn",
+              "type": "string",
+              "description": "Invoke ARN used by aws_apigatewayv2_integration"
+            },
+            {
+              "name": "aws_lambda_function_url.api.function_url",
+              "type": "string",
+              "description": "Direct HTTPS function URL for testing without API Gateway"
+            }
+          ],
+          "code": "# lambda_api.tf\n# ---------------------------------------------------------------\n# IAM role shared by both Lambda functions (least-privilege).\n# ---------------------------------------------------------------\n\ndata \"aws_iam_policy_document\" \"lambda_assume_role\" {\n  statement {\n    effect  = \"Allow\"\n    actions = [\"sts:AssumeRole\"]\n    principals {\n      type        = \"Service\"\n      identifiers = [\"lambda.amazonaws.com\"]\n    }\n  }\n}\n\nresource \"aws_iam_role\" \"lambda_exec\" {\n  name               = \"taskflow-lambda-exec\"\n  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json\n  tags = {\n    Project   = \"TaskFlow\"\n    ManagedBy = \"Terraform\"\n  }\n}\n\n# Basic execution role — allows Lambda to write CloudWatch Logs.\nresource \"aws_iam_role_policy_attachment\" \"lambda_basic\" {\n  role       = aws_iam_role.lambda_exec.name\n  policy_arn = \"arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole\"\n}\n\n# Inline policy: DynamoDB PutItem + Scan scoped to the tasks table.\ndata \"aws_iam_policy_document\" \"dynamodb_access\" {\n  statement {\n    sid    = \"TasksDynamoDBAccess\"\n    effect = \"Allow\"\n    actions = [\n      \"dynamodb:PutItem\",\n      \"dynamodb:Scan\",\n    ]\n    resources = [\n      aws_dynamodb_table.tasks.arn,\n      \"${aws_dynamodb_table.tasks.arn}/index/*\",\n    ]\n  }\n}\n\nresource \"aws_iam_role_policy\" \"dynamodb_access\" {\n  name   = \"taskflow-dynamodb-access\"\n  role   = aws_iam_role.lambda_exec.id\n  policy = data.aws_iam_policy_document.dynamodb_access.json\n}\n\n# Inline policy: SES SendEmail (SES does not support resource-level ARNs\n# for send actions in all regions, so '*' is used per AWS documentation).\ndata \"aws_iam_policy_document\" \"ses_access\" {\n  statement {\n    sid       = \"SESSendEmail\"\n    effect    = \"Allow\"\n    actions   = [\"ses:SendEmail\"]\n    resources = [\"*\"]\n  }\n}\n\nresource \"aws_iam_role_policy\" \"ses_access\" {\n  name   = \"taskflow-ses-access\"\n  role   = aws_iam_role.lambda_exec.id\n  policy = data.aws_iam_policy_document.ses_access.json\n}\n\n# ---------------------------------------------------------------\n# Deployment package — zip the project root at plan time.\n# In CI, replace with a pre-built zip uploaded to S3.\n# ---------------------------------------------------------------\n\ndata \"archive_file\" \"lambda_zip\" {\n  type        = \"zip\"\n  source_dir  = \"${path.root}/../\"\n  output_path = \"${path.root}/dist/taskflow.zip\"\n  excludes = [\n    \".git\",\n    \".terraform\",\n    \"infra\",\n    \"__pycache__\",\n    \"*.pyc\",\n    \"tests\",\n  ]\n}\n\n# ---------------------------------------------------------------\n# API Lambda function.\n# ---------------------------------------------------------------\n\nresource \"aws_lambda_function\" \"api\" {\n  function_name    = \"taskflow-api\"\n  role             = aws_iam_role.lambda_exec.arn\n  runtime          = \"python3.12\"\n  handler          = \"handler.lambda_handler\"\n  filename         = data.archive_file.lambda_zip.output_path\n  source_code_hash = data.archive_file.lambda_zip.output_base64sha256\n  memory_size      = 256\n  # 29 s = API Gateway maximum integration timeout.\n  timeout          = 29\n\n  environment {\n    variables = {\n      DYNAMODB_TABLE  = aws_dynamodb_table.tasks.name\n      SES_FROM_EMAIL  = var.ses_from_email\n      NOTIFY_EMAIL    = var.notify_email\n      AWS_SES_REGION  = var.aws_region\n    }\n  }\n\n  tags = {\n    Project   = \"TaskFlow\"\n    ManagedBy = \"Terraform\"\n  }\n\n  depends_on = [\n    aws_iam_role_policy_attachment.lambda_basic,\n    aws_iam_role_policy.dynamodb_access,\n    aws_iam_role_policy.ses_access,\n  ]\n}\n\n# ---------------------------------------------------------------\n# Direct function URL — simple alternative to API Gateway,\n# useful for testing or internal tooling (IAM auth disabled here;\n# enable auth_type = \"AWS_IAM\" for production direct-URL use).\n# ---------------------------------------------------------------\n\nresource \"aws_lambda_function_url\" \"api\" {\n  function_name      = aws_lambda_function.api.function_name\n  authorization_type = \"NONE\"\n}\n\noutput \"lambda_api_function_url\" {\n  description = \"Direct Lambda function URL (bypasses API Gateway).\"\n  value       = aws_lambda_function_url.api.function_url\n}"
+        },
+        {
+          "id": "b_tf_lambda_notify",
+          "type": "config",
+          "name": "aws_lambda_function.notify",
+          "description": {
+            "high": "Deploys the scheduled Lambda that checks for overdue tasks and sends the daily digest email. An EventBridge Scheduler rule fires it every morning at 08:00 UTC with a 5-minute flexible window to smooth AWS capacity.",
+            "tech": "aws_lambda_function.notify: same runtime (python3.12) and deployment zip as api lambda, handler handler.notify_handler, memory 128 MB (no HTTP overhead), timeout 60s (accommodates DynamoDB full-table scan + SES call). Shares aws_iam_role.lambda_exec. aws_scheduler_schedule uses cron(0 8 * * ? *) in UTC, flexible_time_window of 5 minutes, and a target block pointing at the Lambda ARN with a role that has lambda:InvokeFunction permission. aws_iam_role.scheduler_exec is a separate role for EventBridge Scheduler to assume (scheduler.amazonaws.com principal)."
+          },
+          "inputs": [
+            {
+              "name": "aws_dynamodb_table.tasks.name",
+              "type": "string",
+              "description": "Table name injected as DYNAMODB_TABLE env var"
+            },
+            {
+              "name": "var.ses_from_email",
+              "type": "string",
+              "description": "SES sender address injected as SES_FROM_EMAIL env var"
+            },
+            {
+              "name": "var.notify_email",
+              "type": "string",
+              "description": "Digest recipient injected as NOTIFY_EMAIL env var"
+            },
+            {
+              "name": "var.aws_region",
+              "type": "string",
+              "description": "Region injected as AWS_SES_REGION env var"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "aws_lambda_function.notify.arn",
+              "type": "string",
+              "description": "Lambda ARN targeted by the EventBridge Scheduler schedule"
+            },
+            {
+              "name": "aws_scheduler_schedule.daily_digest",
+              "type": "string",
+              "description": "EventBridge Scheduler schedule that invokes notify Lambda daily at 08:00 UTC"
+            }
+          ],
+          "code": "# lambda_notify.tf\n# ---------------------------------------------------------------\n# Notify Lambda + EventBridge Scheduler for daily digest.\n# ---------------------------------------------------------------\n\nresource \"aws_lambda_function\" \"notify\" {\n  function_name    = \"taskflow-notify\"\n  role             = aws_iam_role.lambda_exec.arn\n  runtime          = \"python3.12\"\n  handler          = \"handler.notify_handler\"\n  filename         = data.archive_file.lambda_zip.output_path\n  source_code_hash = data.archive_file.lambda_zip.output_base64sha256\n  memory_size      = 128\n  timeout          = 60\n\n  environment {\n    variables = {\n      DYNAMODB_TABLE = aws_dynamodb_table.tasks.name\n      SES_FROM_EMAIL = var.ses_from_email\n      NOTIFY_EMAIL   = var.notify_email\n      AWS_SES_REGION = var.aws_region\n    }\n  }\n\n  tags = {\n    Project   = \"TaskFlow\"\n    ManagedBy = \"Terraform\"\n  }\n\n  depends_on = [\n    aws_iam_role_policy_attachment.lambda_basic,\n    aws_iam_role_policy.dynamodb_access,\n    aws_iam_role_policy.ses_access,\n  ]\n}\n\n# ---------------------------------------------------------------\n# IAM role for EventBridge Scheduler to invoke the notify Lambda.\n# ---------------------------------------------------------------\n\ndata \"aws_iam_policy_document\" \"scheduler_assume_role\" {\n  statement {\n    effect  = \"Allow\"\n    actions = [\"sts:AssumeRole\"]\n    principals {\n      type        = \"Service\"\n      identifiers = [\"scheduler.amazonaws.com\"]\n    }\n  }\n}\n\nresource \"aws_iam_role\" \"scheduler_exec\" {\n  name               = \"taskflow-scheduler-exec\"\n  assume_role_policy = data.aws_iam_policy_document.scheduler_assume_role.json\n  tags = {\n    Project   = \"TaskFlow\"\n    ManagedBy = \"Terraform\"\n  }\n}\n\ndata \"aws_iam_policy_document\" \"scheduler_invoke\" {\n  statement {\n    sid     = \"InvokeNotifyLambda\"\n    effect  = \"Allow\"\n    actions = [\"lambda:InvokeFunction\"]\n    resources = [\n      aws_lambda_function.notify.arn,\n    ]\n  }\n}\n\nresource \"aws_iam_role_policy\" \"scheduler_invoke\" {\n  name   = \"taskflow-scheduler-invoke\"\n  role   = aws_iam_role.scheduler_exec.id\n  policy = data.aws_iam_policy_document.scheduler_invoke.json\n}\n\n# ---------------------------------------------------------------\n# EventBridge Scheduler: daily at 08:00 UTC, flexible window 5 min.\n# ---------------------------------------------------------------\n\nresource \"aws_scheduler_schedule\" \"daily_digest\" {\n  name                         = \"taskflow-daily-digest\"\n  schedule_expression          = \"cron(0 8 * * ? *)\"\n  schedule_expression_timezone = \"UTC\"\n\n  flexible_time_window {\n    mode                      = \"FLEXIBLE\"\n    maximum_window_in_minutes = 5\n  }\n\n  target {\n    arn      = aws_lambda_function.notify.arn\n    role_arn = aws_iam_role.scheduler_exec.arn\n\n    # Pass an empty JSON object; notify_handler ignores event contents.\n    input = \"{}\"\n\n    retry_policy {\n      maximum_retry_attempts = 2\n    }\n  }\n}"
+        },
+        {
+          "id": "b_tf_apigw",
+          "type": "config",
+          "name": "aws_apigatewayv2_api.taskflow",
+          "description": {
+            "high": "Sets up the public HTTP API that routes GET and POST requests on the /tasks path to the API Lambda, and outputs the URL you call from a browser or mobile app.",
+            "tech": "aws_apigatewayv2_api (HTTP API, protocol_type HTTP) with CORS configuration allowing all origins for development (tighten for production). Two aws_apigatewayv2_route resources ('GET /tasks', 'POST /tasks') backed by a single aws_apigatewayv2_integration of type AWS_PROXY with payload_format_version 2.0. aws_lambda_permission grants apigateway.amazonaws.com the lambda:InvokeFunction right on the api Lambda, scoped to the specific API ARN. aws_apigatewayv2_stage '$default' with auto_deploy=true and access logging to a CloudWatch log group. Output: invoke_url."
+          },
+          "inputs": [
+            {
+              "name": "aws_lambda_function.api.invoke_arn",
+              "type": "string",
+              "description": "Lambda invoke ARN used in API Gateway integration"
+            },
+            {
+              "name": "aws_lambda_function.api.arn",
+              "type": "string",
+              "description": "Lambda ARN scoped in aws_lambda_permission"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "api_invoke_url",
+              "type": "string",
+              "description": "Public HTTPS base URL for the TaskFlow API, e.g. https://<id>.execute-api.<region>.amazonaws.com"
+            }
+          ],
+          "code": "# apigw.tf\n# ---------------------------------------------------------------\n# HTTP API (API Gateway v2) routing /tasks to the API Lambda.\n# ---------------------------------------------------------------\n\nresource \"aws_apigatewayv2_api\" \"taskflow\" {\n  name          = \"taskflow-http-api\"\n  protocol_type = \"HTTP\"\n  description   = \"TaskFlow REST API\"\n\n  # CORS: tighten allow_origins for production.\n  cors_configuration {\n    allow_origins = [\"*\"]\n    allow_methods = [\"GET\", \"POST\", \"OPTIONS\"]\n    allow_headers = [\"Content-Type\", \"Authorization\"]\n    max_age       = 300\n  }\n\n  tags = {\n    Project   = \"TaskFlow\"\n    ManagedBy = \"Terraform\"\n  }\n}\n\n# ---------------------------------------------------------------\n# Lambda integration (AWS_PROXY, payload format 2.0).\n# ---------------------------------------------------------------\n\nresource \"aws_apigatewayv2_integration\" \"api_lambda\" {\n  api_id                 = aws_apigatewayv2_api.taskflow.id\n  integration_type       = \"AWS_PROXY\"\n  integration_uri        = aws_lambda_function.api.invoke_arn\n  payload_format_version = \"2.0\"\n  timeout_milliseconds   = 29000\n}\n\n# ---------------------------------------------------------------\n# Routes.\n# ---------------------------------------------------------------\n\nresource \"aws_apigatewayv2_route\" \"get_tasks\" {\n  api_id    = aws_apigatewayv2_api.taskflow.id\n  route_key = \"GET /tasks\"\n  target    = \"integrations/${aws_apigatewayv2_integration.api_lambda.id}\"\n}\n\nresource \"aws_apigatewayv2_route\" \"post_tasks\" {\n  api_id    = aws_apigatewayv2_api.taskflow.id\n  route_key = \"POST /tasks\"\n  target    = \"integrations/${aws_apigatewayv2_integration.api_lambda.id}\"\n}\n\n# ---------------------------------------------------------------\n# Default stage with auto-deploy and access logging.\n# ---------------------------------------------------------------\n\nresource \"aws_cloudwatch_log_group\" \"apigw_access\" {\n  name              = \"/aws/apigateway/taskflow\"\n  retention_in_days = 30\n\n  tags = {\n    Project   = \"TaskFlow\"\n    ManagedBy = \"Terraform\"\n  }\n}\n\nresource \"aws_apigatewayv2_stage\" \"default\" {\n  api_id      = aws_apigatewayv2_api.taskflow.id\n  name        = \"$default\"\n  auto_deploy = true\n\n  access_log_settings {\n    destination_arn = aws_cloudwatch_log_group.apigw_access.arn\n    format = jsonencode({\n      requestId      = \"$context.requestId\"\n      sourceIp       = \"$context.identity.sourceIp\"\n      httpMethod     = \"$context.httpMethod\"\n      routeKey       = \"$context.routeKey\"\n      status         = \"$context.status\"\n      responseLength = \"$context.responseLength\"\n      durationMs     = \"$context.responseLatency\"\n    })\n  }\n\n  tags = {\n    Project   = \"TaskFlow\"\n    ManagedBy = \"Terraform\"\n  }\n}\n\n# ---------------------------------------------------------------\n# Lambda permission: allow API Gateway to invoke the API Lambda.\n# ---------------------------------------------------------------\n\nresource \"aws_lambda_permission\" \"apigw_invoke_api\" {\n  statement_id  = \"AllowAPIGatewayInvoke\"\n  action        = \"lambda:InvokeFunction\"\n  function_name = aws_lambda_function.api.function_name\n  principal     = \"apigateway.amazonaws.com\"\n  # Scope to this specific API's ARN to avoid confused-deputy risk.\n  source_arn    = \"${aws_apigatewayv2_api.taskflow.execution_arn}/*/*\"\n}\n\n# ---------------------------------------------------------------\n# Output the public invoke URL.\n# ---------------------------------------------------------------\n\noutput \"api_invoke_url\" {\n  description = \"Public HTTPS base URL for the TaskFlow API (append /tasks).\"\n  value       = aws_apigatewayv2_stage.default.invoke_url\n}"
+        },
+        {
+          "id": "b_tf_ses",
+          "type": "config",
+          "name": "aws_ses_email_identity.sender",
+          "description": {
+            "high": "Registers the sender email address with Amazon SES so AWS will allow email to be sent from it. AWS sends a verification link to that address — the owner must click it before any emails can go out. Note: new AWS accounts are in the SES sandbox, which means you can only send to verified addresses; request production access in the SES console when ready.",
+            "tech": "aws_ses_email_identity resource verifying var.ses_from_email in the deployment region. SES sandbox restrictions apply to new accounts: both sender and recipient must be individually verified, and daily sending quotas are capped. To send to arbitrary recipients, submit a 'Request production access' form in the SES console. The output exposes the DKIM tokens for optional Route 53 DNS record creation (not automated here). The resource is idempotent — re-applying re-sends the verification email if the address is not yet verified."
+          },
+          "inputs": [
+            {
+              "name": "var.ses_from_email",
+              "type": "string",
+              "description": "Email address to register and verify with SES as the sender identity"
+            }
+          ],
+          "outputs": [
+            {
+              "name": "aws_ses_email_identity.sender.arn",
+              "type": "string",
+              "description": "ARN of the verified SES email identity"
+            },
+            {
+              "name": "ses_identity_arn",
+              "type": "string",
+              "description": "Output: ARN of the SES sender identity for reference in monitoring/alerting"
+            }
+          ],
+          "code": "# ses.tf\n# ---------------------------------------------------------------\n# SES sender email identity verification.\n#\n# IMPORTANT — SES Sandbox:\n#   New AWS accounts are placed in the SES sandbox automatically.\n#   In sandbox mode:\n#     - Only VERIFIED email addresses can receive mail.\n#     - Daily send quota is 200 emails, 1 email/second.\n#   To send to arbitrary recipients, request production access:\n#   https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html\n#\n# After applying, AWS sends a verification email to var.ses_from_email.\n# The owner MUST click the link before Lambda can send via this identity.\n# ---------------------------------------------------------------\n\nresource \"aws_ses_email_identity\" \"sender\" {\n  email = var.ses_from_email\n}\n\noutput \"ses_identity_arn\" {\n  description = \"ARN of the SES sender email identity.\"\n  value       = aws_ses_email_identity.sender.arn\n}"
+        }
+      ]
     }
   ],
   "links": [
